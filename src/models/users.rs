@@ -15,3 +15,11 @@ pub struct User {
 pub struct NewUser {
     pub username: String,
 }
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct UpdateUser {
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+}

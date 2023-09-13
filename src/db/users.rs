@@ -1,8 +1,11 @@
+use azure_data_tables::IfMatchCondition;
 use azure_data_tables::{operations::InsertEntityResponse, prelude::TableServiceClient};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::models::users::NewUser;
+use crate::models::UpdateUser;
 use crate::util::Result;
 
 use super::DateTime;
@@ -86,4 +89,59 @@ pub async fn create_new_user(
         .entity_with_metadata
         .map(|e| e.entity.into())
         .ok_or("User create failed".into())
+}
+
+pub async fn get_users(
+    client: &TableServiceClient,
+    page: usize,
+) -> Result<Option<Vec<crate::models::User>>> {
+    // Skip to the desired page in the stream
+    let page = client
+        .table_client(USERS_TABLE)
+        .query()
+        .into_stream::<User>()
+        .skip(page - 1)
+        .next()
+        .await;
+
+    // Map the page results to the output User type
+    Ok(page.transpose()?.map(|response| {
+        let users: Vec<crate::models::User> =
+            response.entities.into_iter().map(|u| u.into()).collect();
+        users
+    }))
+}
+
+pub async fn get_user(client: &TableServiceClient, id: &str) -> Result<crate::models::User> {
+    let response = client
+        .table_client(USERS_TABLE)
+        .partition_key_client(id)
+        .entity_client(id)?
+        .get::<User>()
+        .await?;
+    Ok(response.entity.into())
+}
+
+pub async fn update_user(
+    client: &TableServiceClient,
+    id: &str,
+    update: UpdateUser,
+) -> azure_core::Result<()> {
+    client
+        .table_client(USERS_TABLE)
+        .partition_key_client(id)
+        .entity_client(id)?
+        .merge(update, IfMatchCondition::Any)?
+        .await?;
+    Ok(())
+}
+
+pub async fn delete_user(client: &TableServiceClient, id: &str) -> azure_core::Result<()> {
+    client
+        .table_client(USERS_TABLE)
+        .partition_key_client(id)
+        .entity_client(id)?
+        .delete()
+        .await?;
+    Ok(())
 }
