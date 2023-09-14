@@ -11,6 +11,7 @@ use azure_security_keyvault::KeyvaultClient;
 use azure_storage::StorageCredentials;
 use azure_storage_blobs::prelude::BlobServiceClient;
 
+mod blueprint;
 mod db;
 mod models;
 mod routes;

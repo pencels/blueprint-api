@@ -1,5 +1,9 @@
-pub mod users;
+mod users;
+use azure_data_tables::prelude::TableServiceClient;
+use futures::StreamExt;
 pub use users::*;
+mod assets;
+pub use assets::*;
 
 use serde::{Deserialize, Serialize};
 
@@ -53,4 +57,32 @@ impl From<DateTime> for OffsetDateTime {
     fn from(value: DateTime) -> Self {
         value.0
     }
+}
+
+pub async fn get_entities<T, U>(
+    client: &TableServiceClient,
+    table_name: &str,
+    page: usize,
+) -> crate::util::Result<Option<Vec<U>>>
+where
+    T: for<'a> Deserialize<'a> + Send + Sync,
+    U: From<T>,
+{
+    // Skip to the desired page in the stream
+    let page = client
+        .table_client(table_name)
+        .query()
+        .into_stream::<T>()
+        .skip(page - 1)
+        .next()
+        .await;
+
+    // Map the page results to the output User type
+    Ok(page.transpose()?.map(|response| {
+        response
+            .entities
+            .into_iter()
+            .map(|e| e.into())
+            .collect::<Vec<_>>()
+    }))
 }

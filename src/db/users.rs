@@ -1,14 +1,13 @@
 use azure_data_tables::IfMatchCondition;
 use azure_data_tables::{operations::InsertEntityResponse, prelude::TableServiceClient};
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::models::users::NewUser;
+use crate::models::NewUser;
 use crate::models::UpdateUser;
 use crate::util::Result;
 
-use super::DateTime;
+use super::{get_entities, DateTime};
 
 const USERS_TABLE: &str = "users";
 
@@ -30,8 +29,8 @@ pub struct User {
     _created_tag: (),
 }
 
-impl From<crate::models::users::User> for User {
-    fn from(user: crate::models::users::User) -> Self {
+impl From<crate::models::User> for User {
+    fn from(user: crate::models::User) -> Self {
         User {
             partition_key: user.id.clone(),
             row_key: user.id,
@@ -44,7 +43,7 @@ impl From<crate::models::users::User> for User {
     }
 }
 
-impl From<User> for crate::models::users::User {
+impl From<User> for crate::models::User {
     fn from(db_user: User) -> Self {
         Self {
             avatar_url: db_user.avatar_url,
@@ -95,21 +94,7 @@ pub async fn get_users(
     client: &TableServiceClient,
     page: usize,
 ) -> Result<Option<Vec<crate::models::User>>> {
-    // Skip to the desired page in the stream
-    let page = client
-        .table_client(USERS_TABLE)
-        .query()
-        .into_stream::<User>()
-        .skip(page - 1)
-        .next()
-        .await;
-
-    // Map the page results to the output User type
-    Ok(page.transpose()?.map(|response| {
-        let users: Vec<crate::models::User> =
-            response.entities.into_iter().map(|u| u.into()).collect();
-        users
-    }))
+    get_entities::<User, crate::models::User>(client, USERS_TABLE, page).await
 }
 
 pub async fn get_user(client: &TableServiceClient, id: &str) -> Result<crate::models::User> {

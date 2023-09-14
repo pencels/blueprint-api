@@ -1,13 +1,12 @@
-use actix_web::{
-    delete, get, http::header, patch, post, web, HttpRequest, HttpResponse, Responder,
-};
+use actix_web::{delete, get, patch, post, web, HttpRequest, HttpResponse, Responder};
 use azure_data_tables::prelude::TableServiceClient;
-use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use crate::{
     db,
     models::{NewUser, UpdateUser},
+    routes::{util::created, v1::Paginated},
+    util::Result,
 };
 
 pub fn config(cfg: &mut actix_web::web::ServiceConfig) {
@@ -17,14 +16,6 @@ pub fn config(cfg: &mut actix_web::web::ServiceConfig) {
         .service(update_user)
         .service(delete_user);
 }
-
-#[derive(Serialize, Deserialize, Validate)]
-pub struct Paginated {
-    #[validate(range(min = 1, message = "must be an integer >= 1"))]
-    page: Option<usize>,
-}
-
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[get("users")]
 pub async fn get_users(
@@ -41,15 +32,6 @@ pub async fn get_users(
     }
 }
 
-#[get("users/{id}")]
-pub async fn get_user(
-    client: web::Data<TableServiceClient>,
-    id: web::Path<String>,
-) -> Result<impl Responder> {
-    let user = db::get_user(&client, &id).await?;
-    Ok(HttpResponse::Ok().json(user))
-}
-
 #[post("users")]
 pub async fn add_user(
     req: HttpRequest,
@@ -57,13 +39,16 @@ pub async fn add_user(
     body: web::Json<NewUser>,
 ) -> Result<impl Responder> {
     let user = db::create_new_user(&client, body.into_inner()).await?;
-    let id = serde_json::to_value(&user.id)?;
-    Ok(HttpResponse::Created()
-        .append_header((
-            header::LOCATION,
-            req.uri().to_string() + "/" + id.as_str().unwrap(),
-        ))
-        .json(user))
+    Ok(created(req, &user.id, &user))
+}
+
+#[get("users/{id}")]
+pub async fn get_user(
+    client: web::Data<TableServiceClient>,
+    id: web::Path<String>,
+) -> Result<impl Responder> {
+    let user = db::get_user(&client, &id).await?;
+    Ok(HttpResponse::Ok().json(user))
 }
 
 #[patch("users/{id}")]
