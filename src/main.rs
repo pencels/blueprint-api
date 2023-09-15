@@ -11,7 +11,7 @@ use azure_security_keyvault::KeyvaultClient;
 use azure_storage::StorageCredentials;
 use azure_storage_blobs::prelude::BlobServiceClient;
 
-use crate::blueprint::{run_template, Template};
+use crate::{blueprint::compositor::Compositor, models::Template};
 
 mod blueprint;
 mod db;
@@ -45,16 +45,17 @@ async fn main() -> std::io::Result<()> {
     let blob_service = BlobServiceClient::new(STORAGE_ACCOUNT_NAME, cred.clone());
     let table_service = TableServiceClient::new(STORAGE_ACCOUNT_NAME, cred.clone());
 
+    let compositor = Compositor::new(table_service.clone(), blob_service.clone());
+
     // Template processing
     let (send, recv) = async_channel::unbounded::<(String, Template)>();
     for _ in 0..NUM_TEMPLATE_WORKERS {
-        let table_service = table_service.clone();
-        let blob_service = blob_service.clone();
+        let compositor = compositor.clone();
         let recv = recv.clone();
         tokio::spawn(async move {
             loop {
                 let (run_id, template) = recv.recv().await.expect("channel closed unexpectedly");
-                match run_template(&table_service, &blob_service, &run_id, template).await {
+                match compositor.run_template(&run_id, template).await {
                     Ok(_) => log::info!("template run {} succeeded", &run_id),
                     Err(e) => log::error!("template run {} failed: {}", &run_id, e),
                 };
