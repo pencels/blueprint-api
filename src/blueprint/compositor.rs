@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::{iter, slice};
 
+use azure_data_tables::operations::InsertEntityResponse;
 use azure_data_tables::prelude::TableServiceClient;
 use azure_storage_blobs::prelude::BlobServiceClient;
 use futures::TryStreamExt;
@@ -10,8 +11,9 @@ use image::imageops::FilterType;
 use image::{imageops, RgbaImage};
 use imageproc::geometric_transformations::Interpolation;
 use itertools::{Either, Itertools, MultiProduct};
+use time::OffsetDateTime;
 
-use crate::db::Asset;
+use crate::db::{Asset, CompositorRun, CompositorRunStatus, DateTime};
 use crate::models::{Degrees, Scale, Template};
 use crate::util::Result;
 
@@ -31,7 +33,7 @@ impl Compositor {
         }
     }
 
-    pub async fn apply_template(
+    pub async fn apply_template_instance(
         &self,
         template: &Template,
         image_cache: &ImageCache,
@@ -67,9 +69,29 @@ impl Compositor {
 
     pub async fn run_template(&self, run_id: &str, mut template: Template) -> Result<()> {
         let output = self.blob_client.container_client("template-output");
+
+        let run_entity = self
+            .table_client
+            .table_client("runs")
+            .partition_key_client(run_id)
+            .entity_client(run_id)?;
+
+        let mut run = CompositorRun {
+            partition_key: run_id.to_string(),
+            row_key: run_id.to_string(),
+            created: OffsetDateTime::now_utc().into(),
+            progress: 0,
+            status: CompositorRunStatus::Running,
+            _created_tag: (),
+        };
+        run_entity.insert_or_merge(&run)?.await?;
+
         for refs in template.aliases.values_mut() {
-            *refs = expand_refs(&self.table_client, refs.iter()).await?;
+            *refs = self.expand_refs(refs.iter()).await?;
         }
+
+        let mut count = 0;
+        let estimated_upper_bound = template.aliases.get("fg").unwrap().len();
 
         let (vals, iter) = iter_alias_binds(&template.aliases);
         for tuple in iter {
@@ -79,7 +101,7 @@ impl Compositor {
             let image_cache = ImageCache::new(Arc::new(self.blob_client.clone()));
 
             let result = self
-                .apply_template(&template, &image_cache, &aliases)
+                .apply_template_instance(&template, &image_cache, &aliases)
                 .await?;
 
             let mut buf = Vec::new();
@@ -105,10 +127,72 @@ impl Compositor {
                 .blob_client(relative_blob_name)
                 .put_block_blob(buf)
                 .await?;
+
+            count += 1;
+
+            run.progress = (count * 100 / estimated_upper_bound) as u32;
+            run_entity.insert_or_merge(&run)?.await?;
         }
 
+        run.progress = 100;
+        run.status = CompositorRunStatus::Succeeded;
+        run_entity.insert_or_merge(&run)?.await?;
         Ok(())
     }
+
+    async fn get_pack_asset_ids(&self, pack_id: &str) -> Result<impl Iterator<Item = String>> {
+        let resp: Vec<_> = self
+            .table_client
+            .table_client("assets")
+            .query()
+            .filter(format!("PartitionKey eq '{}'", pack_id))
+            .into_stream::<Asset>()
+            .try_collect()
+            .await?;
+
+        let asset_ids = resp
+            .into_iter()
+            .flat_map(|res| res.entities)
+            .map(|asset| asset.row_key);
+
+        Ok(asset_ids)
+    }
+
+    async fn expand_ref<S>(&self, item: S) -> Result<impl Iterator<Item = String>>
+    where
+        S: AsRef<str>,
+    {
+        let item = item.as_ref();
+        let iter = match item.split_once(':') {
+            Some(("pack", id)) => Either::Left(self.get_pack_asset_ids(id).await?),
+            Some((ref_type, _)) => Err(format!("unrecognized reference type: {}", ref_type))?,
+            None => Either::Right(iter::once(item.to_string())),
+        };
+        Ok(iter)
+    }
+
+    async fn expand_refs<S>(&self, refs: impl Iterator<Item = S>) -> Result<Vec<String>>
+    where
+        S: AsRef<str>,
+    {
+        let futs = refs.map(|item| self.expand_ref(item));
+
+        let mut result = Vec::new();
+        for fut in futs {
+            let vals = fut.await?;
+            result.extend(vals);
+        }
+        Ok(result)
+    }
+}
+
+/// Returns an iterator over all the possible alias bindings for the given mapping.
+pub fn iter_alias_binds(
+    aliases: &HashMap<String, Vec<String>>,
+) -> (Vec<&str>, MultiProduct<slice::Iter<String>>) {
+    let (keys, values): (Vec<_>, Vec<_>) = aliases.iter().unzip();
+    let result = values.iter().map(|v| *v).multi_cartesian_product();
+    (keys.iter().map(|s| s.as_str()).collect(), result)
 }
 
 fn copy_to_center(src: &RgbaImage, dest: &mut RgbaImage) {
@@ -139,63 +223,4 @@ fn scale(image: &RgbaImage, scale: Scale) -> RgbaImage {
     let nh = (image.height() as f32 * scale.0) as u32;
 
     imageops::resize(image, nw, nh, FilterType::Lanczos3)
-}
-
-/// Returns an iterator over all the possible alias bindings for the given mapping.
-pub fn iter_alias_binds(
-    aliases: &HashMap<String, Vec<String>>,
-) -> (Vec<&str>, MultiProduct<slice::Iter<String>>) {
-    let (keys, values): (Vec<_>, Vec<_>) = aliases.iter().unzip();
-    let result = values.iter().map(|v| *v).multi_cartesian_product();
-    (keys.iter().map(|s| s.as_str()).collect(), result)
-}
-
-async fn get_pack_asset_ids(
-    tables: &TableServiceClient,
-    pack_id: &str,
-) -> Result<impl Iterator<Item = String>> {
-    let resp: Vec<_> = tables
-        .table_client("assets")
-        .query()
-        .filter(format!("PartitionKey eq '{}'", pack_id))
-        .into_stream::<Asset>()
-        .try_collect()
-        .await?;
-
-    let asset_ids = resp
-        .into_iter()
-        .flat_map(|res| res.entities)
-        .map(|asset| asset.row_key);
-
-    Ok(asset_ids)
-}
-
-async fn expand_ref<S>(tables: &TableServiceClient, item: S) -> Result<impl Iterator<Item = String>>
-where
-    S: AsRef<str>,
-{
-    let item = item.as_ref();
-    let iter = match item.split_once(':') {
-        Some(("pack", id)) => Either::Left(get_pack_asset_ids(&tables, id).await?),
-        Some((ref_type, _)) => Err(format!("unrecognized reference type: {}", ref_type))?,
-        None => Either::Right(iter::once(item.to_string())),
-    };
-    Ok(iter)
-}
-
-async fn expand_refs<S>(
-    tables: &TableServiceClient,
-    refs: impl Iterator<Item = S>,
-) -> Result<Vec<String>>
-where
-    S: AsRef<str>,
-{
-    let futs = refs.map(|item| expand_ref(tables, item));
-
-    let mut result = Vec::new();
-    for fut in futs {
-        let vals = fut.await?;
-        result.extend(vals);
-    }
-    Ok(result)
 }

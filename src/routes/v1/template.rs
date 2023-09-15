@@ -44,5 +44,5 @@ async fn run_template(
 
     queue.send((run_id.clone(), template)).await?;
 
-    Ok(HttpResponse::Ok().json(TemplateRun { run_id }))
+    Ok(HttpResponse::Accepted().json(TemplateRun { run_id }))
 }
