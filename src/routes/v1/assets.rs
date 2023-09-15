@@ -11,7 +11,7 @@ use azure_storage_blobs::prelude::BlobServiceClient;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    db::{self, Asset},
+    db,
     models::AssetPack,
     routes::util::{created, download},
     util::Result,
@@ -74,27 +74,24 @@ async fn create_pack(
 
 #[get("assets/{asset_id}/blob")]
 async fn download_asset(
-    tables: web::Data<TableServiceClient>,
     blobs: web::Data<BlobServiceClient>,
-    path: web::Path<(String, String)>,
+    asset_id: web::Path<String>,
 ) -> Result<impl Responder> {
-    let (pack_id, asset_id) = path.into_inner();
+    let asset_id = asset_id.into_inner();
 
-    let response = tables
-        .table_client("assets")
-        .partition_key_client(&pack_id)
-        .entity_client(&asset_id)?
-        .get::<Asset>()
-        .await?;
-    let asset_metadata = response.entity;
+    let blob_client = blobs.container_client("assets").blob_client(&asset_id);
+    let tags_response = blob_client.get_tags().await?;
+    let content = blob_client.get_content().await?;
 
-    let content = blobs
-        .container_client("assets")
-        .blob_client(&asset_id)
-        .get_content()
-        .await?;
+    let tags = tags_response.tags;
+    let file_name = tags
+        .into_iter()
+        .filter(|(k, _)| k == "file_name")
+        .nth(0)
+        .map(|(_, v)| v)
+        .unwrap_or(asset_id);
 
-    Ok(download(&asset_metadata.file_name, content))
+    Ok(download(&file_name, content))
 }
 
 #[post("assets")]
@@ -108,6 +105,5 @@ async fn upload_asset(
     let asset_id = uuid::Uuid::new_v4().to_string();
 
     let asset = db::upload_asset(&tables, &blobs, form.file, &pack_id, &asset_id).await?;
-
     Ok(created(req, &asset_id, asset))
 }

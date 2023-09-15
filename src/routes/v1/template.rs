@@ -1,56 +1,48 @@
+use std::collections::HashMap;
+
 use crate::{
-    blueprint::{BlendMode, Degrees, Layer, Scale, Template, Transform},
-    routes::util::download,
+    blueprint::{Layer, Template},
     util::Result,
 };
-use actix_web::{get, http::StatusCode, post, web, HttpResponse, Responder};
-use azure_data_tables::prelude::TableServiceClient;
-use azure_storage_blobs::prelude::BlobServiceClient;
-use image::codecs::png::PngEncoder;
+use actix_web::{post, web, HttpResponse, Responder};
+use async_channel::Sender;
+use serde::{Deserialize, Serialize};
 
 pub fn config(cfg: &mut actix_web::web::ServiceConfig) {
     cfg.service(run_template);
 }
 
-#[get("templates/lol")]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TemplateRun {
+    run_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TemplateRequest {
+    aliases: HashMap<String, Vec<String>>,
+    canvas_size: (u32, u32),
+    layers: Vec<Layer>,
+}
+
+impl From<TemplateRequest> for Template {
+    fn from(value: TemplateRequest) -> Self {
+        Self {
+            aliases: value.aliases,
+            canvas_size: value.canvas_size,
+            layers: value.layers,
+        }
+    }
+}
+
+#[post("compositor")]
 async fn run_template(
-    tables: web::Data<TableServiceClient>,
-    blobs: web::Data<BlobServiceClient>,
+    queue: web::Data<Sender<(String, Template)>>,
+    template: web::Json<TemplateRequest>,
 ) -> Result<impl Responder> {
-    let template = Template {
-        canvas_size: (256, 256),
-        layers: vec![
-            Layer {
-                blend_mode: BlendMode::Normal,
-                image: image::io::Reader::open("assets/baseg.webp")?
-                    .decode()?
-                    .into_rgba8(),
-                opacity: 1.0,
-                transform: Transform {
-                    offset: (0, 0),
-                    scale: Scale(1.3),
-                    rotate: Degrees(45.0),
-                },
-            },
-            Layer {
-                blend_mode: BlendMode::Normal,
-                image: image::io::Reader::open("assets/dh.png")?
-                    .decode()?
-                    .into_rgba8(),
-                opacity: 1.0,
-                transform: Transform {
-                    offset: (0, 0),
-                    scale: Scale(1.0),
-                    rotate: Degrees(0.0),
-                },
-            },
-        ],
-    };
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let template: Template = template.into_inner().into();
 
-    let result = template.apply()?;
+    queue.send((run_id.clone(), template)).await?;
 
-    let mut buf = Vec::new();
-    result.write_with_encoder(PngEncoder::new(&mut buf))?;
-
-    Ok(HttpResponse::Ok().body(buf))
+    Ok(HttpResponse::Ok().json(TemplateRun { run_id }))
 }

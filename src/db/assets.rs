@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::get_entities;
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Asset {
     #[serde(rename = "PartitionKey")]
     pub partition_key: String,
