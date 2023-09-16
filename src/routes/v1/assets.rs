@@ -1,20 +1,23 @@
 use actix_multipart::form::{tempfile::TempFile, text, MultipartForm};
 use actix_web::{
-    get,
+    delete, get,
     http::StatusCode,
     post,
     web::{self, Json},
-    HttpRequest, Responder,
+    HttpRequest, HttpResponse, Responder,
 };
-use azure_data_tables::prelude::TableServiceClient;
+use async_channel::Sender;
+use azure_data_tables::prelude::{PartitionKeyClient, TableServiceClient};
 use azure_storage_blobs::prelude::BlobServiceClient;
+use futures::{stream, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     db,
-    models::AssetPack,
+    models::{Asset, AssetPack},
     routes::util::{created, download},
     util::Result,
+    Order,
 };
 
 use super::Paginated;
@@ -22,15 +25,17 @@ use super::Paginated;
 pub fn config(cfg: &mut actix_web::web::ServiceConfig) {
     cfg.service(upload_asset)
         .service(download_asset)
+        .service(get_pack_assets)
         .service(get_packs)
-        .service(create_pack);
+        .service(create_pack)
+        .service(delete_pack);
 }
 
 #[derive(Debug, MultipartForm)]
 struct UploadAsset {
     #[multipart]
     pack_id: text::Text<String>,
-    #[multipart(limit = "512000")]
+    #[multipart]
     file: TempFile,
 }
 
@@ -70,6 +75,40 @@ async fn create_pack(
     let pack = db::create_pack(&tables, pack).await?;
 
     Ok(created(req, &pack_id, pack))
+}
+
+#[delete("packs/{pack_id}")]
+async fn delete_pack(
+    worker_queue: web::Data<Sender<Order>>,
+    pack_id: web::Path<String>,
+) -> Result<impl Responder> {
+    let pack_id = pack_id.into_inner();
+
+    worker_queue.send(Order::DeletePack(pack_id)).await?;
+
+    Ok(HttpResponse::Accepted().finish())
+}
+
+#[get("packs/{pack_id}/assets")]
+async fn get_pack_assets(
+    tables: web::Data<TableServiceClient>,
+    pack_id: web::Path<String>,
+) -> Result<impl Responder> {
+    let pack_id = pack_id.into_inner();
+    let pages: Vec<_> = tables
+        .table_client("assets")
+        .query()
+        .filter(format!("PartitionKey eq '{}'", pack_id))
+        .into_stream::<db::Asset>()
+        .try_collect()
+        .await?;
+
+    let assets: Vec<Asset> = pages
+        .into_iter()
+        .flat_map(|p| p.entities)
+        .map(|a| a.into())
+        .collect();
+    Ok(HttpResponse::Ok().json(assets))
 }
 
 #[get("assets/{asset_id}/blob")]

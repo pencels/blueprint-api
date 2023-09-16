@@ -6,8 +6,10 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+actix-cors = "0.6.4"
 actix-multipart = "0.6.1"
 actix-web = "4.4.0"
+anyhow = "1.0.75"
 async-channel = "1.9.0"
 azure_core = "0.15.0"
 azure_data_tables = "0.15.0"

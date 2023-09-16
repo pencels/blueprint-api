@@ -3,8 +3,12 @@ use std::io::Read;
 use crate::util::Result;
 use actix_multipart::form::tempfile::TempFile;
 use azure_core::request_options::Metadata;
-use azure_data_tables::{operations::InsertEntityResponse, prelude::TableServiceClient};
+use azure_data_tables::{
+    operations::InsertEntityResponse,
+    prelude::{PartitionKeyClient, TableServiceClient},
+};
 use azure_storage_blobs::prelude::BlobServiceClient;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use super::get_entities;
@@ -97,7 +101,9 @@ pub async fn upload_asset(
 ) -> crate::util::Result<crate::models::Asset> {
     let file_name = file_metadata
         .file_name
-        .unwrap_or_else(|| pack_id.to_string());
+        .as_ref()
+        .map(|name| name.split_once('/').map_or(name.as_str(), |(_, path)| path))
+        .map_or_else(|| pack_id.to_string(), |s| s.to_string());
     let content_type_string = file_metadata
         .content_type
         .as_ref()
@@ -109,6 +115,7 @@ pub async fn upload_asset(
 
     let mut metadata = Metadata::new();
     metadata.insert("file_name", file_name.clone());
+    metadata.insert("pack_id", pack_id.to_string());
 
     blobs
         .container_client("assets")
@@ -133,4 +140,50 @@ pub async fn upload_asset(
         .await?;
 
     Ok(asset.into())
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct GenericRowKeyEntity {
+    #[serde(rename = "RowKey")]
+    row_key: String,
+}
+
+async fn delete_asset(blobs: &BlobServiceClient, partition: &PartitionKeyClient, row_key: &str) {
+    log::info!("deleting = {}", row_key);
+    let _ = blobs
+        .container_client("assets")
+        .blob_client(row_key)
+        .delete()
+        .await;
+    let _ = partition.entity_client(row_key).unwrap().delete().await;
+}
+
+pub async fn delete_pack(tables: &TableServiceClient, blobs: &BlobServiceClient, pack_id: String) {
+    let pack_id = pack_id.as_str();
+    // Delete associated assets
+    let partition = tables.table_client("assets").partition_key_client(pack_id);
+    let mut stream = tables
+        .table_client("assets")
+        .query()
+        .filter(format!("PartitionKey eq '{}'", &pack_id))
+        .select("RowKey")
+        .into_stream::<GenericRowKeyEntity>();
+
+    while let Some(res) = stream.next().await {
+        let res = res.unwrap();
+        let row_keys: Vec<_> = res.entities.iter().map(|e| e.row_key.to_string()).collect();
+
+        for key in row_keys {
+            delete_asset(blobs, &partition, &key).await;
+        }
+    }
+
+    // Delete pack entry
+    let _ = tables
+        .table_client("packs")
+        .partition_key_client(pack_id)
+        .entity_client(pack_id)
+        .unwrap()
+        .delete()
+        .await;
 }
