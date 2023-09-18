@@ -1,14 +1,15 @@
 mod users;
 use azure_data_tables::prelude::TableServiceClient;
 use futures::StreamExt;
+use rand::Rng;
 pub use users::*;
 mod assets;
 pub use assets::*;
 mod runs;
 pub use runs::*;
 
+use crate::util::Result;
 use serde::{Deserialize, Serialize};
-
 use std::num::NonZeroU8;
 
 use time::{
@@ -79,7 +80,7 @@ where
         .next()
         .await;
 
-    // Map the page results to the output User type
+    // Map the page results to the output type
     Ok(page.transpose()?.map(|response| {
         response
             .entities

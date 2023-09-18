@@ -2,48 +2,51 @@ use actix_multipart::form::{tempfile::TempFile, text, MultipartForm};
 use actix_web::{
     delete, get,
     http::StatusCode,
-    post,
+    patch, post,
     web::{self, Json},
-    HttpRequest, HttpResponse, Responder,
+    HttpResponse, Responder,
 };
-use async_channel::Sender;
-use azure_data_tables::prelude::{PartitionKeyClient, TableServiceClient};
+use azure_data_tables::prelude::TableServiceClient;
 use azure_storage_blobs::prelude::BlobServiceClient;
-use futures::{stream, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
 use crate::{
-    db,
-    models::{Asset, AssetPack},
-    routes::util::{created, download},
+    db::{self, DateTime},
+    models::AssetPack,
+    routes::util::download,
     util::Result,
-    Order,
 };
 
 use super::Paginated;
 
 pub fn config(cfg: &mut actix_web::web::ServiceConfig) {
-    cfg.service(upload_asset)
-        .service(download_asset)
-        .service(get_pack_assets)
+    cfg.service(download_asset)
         .service(get_packs)
+        .service(get_pack)
         .service(create_pack)
+        .service(update_pack)
         .service(delete_pack);
 }
 
 #[derive(Debug, MultipartForm)]
-struct UploadAsset {
-    #[multipart]
-    pack_id: text::Text<String>,
+struct UploadPack {
+    name: text::Text<String>,
+    description: text::Text<String>,
+    tags: text::Text<String>,
+    version: text::Text<String>,
     #[multipart]
     file: TempFile,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct CreatePack {
-    name: String,
-    description: String,
-    tags: Vec<String>,
+#[derive(Debug, Serialize, Deserialize)]
+struct UpdatePack {
+    pub slug: String,
+    pub name: String,
+    pub description: String,
+    pub tags: Vec<String>,
+    pub last_modified: DateTime,
+    pub version: String,
 }
 
 #[get("packs")]
@@ -56,59 +59,98 @@ async fn get_packs(
     Ok((Json(packs), StatusCode::OK))
 }
 
-#[post("packs")]
-async fn create_pack(
-    req: HttpRequest,
+#[get("packs/{pack_id}")]
+async fn get_pack(
     tables: web::Data<TableServiceClient>,
-    create_pack: web::Json<CreatePack>,
+    slug: web::Path<String>,
 ) -> Result<impl Responder> {
-    let create_pack = create_pack.into_inner();
-    let pack_id = uuid::Uuid::new_v4().to_string();
+    let slug = slug.into_inner();
 
+    let response = tables
+        .table_client("packs")
+        .partition_key_client(&slug)
+        .entity_client(&slug)?
+        .get::<db::AssetPack>()
+        .await;
+
+    match response {
+        Ok(response) => {
+            let asset: AssetPack = response.entity.into();
+            Ok(HttpResponse::Ok().json(asset))
+        }
+        Err(_) => Ok(HttpResponse::NotFound().finish()),
+    }
+}
+
+#[post("packs/{pack_id}")]
+async fn create_pack(
+    tables: web::Data<TableServiceClient>,
+    blobs: web::Data<BlobServiceClient>,
+    slug: web::Path<String>,
+    MultipartForm(form): MultipartForm<UploadPack>,
+) -> Result<impl Responder> {
     let pack = AssetPack {
-        id: pack_id.clone(),
-        description: create_pack.description,
-        name: create_pack.name,
-        tags: create_pack.tags,
+        slug: slug.clone(),
+        description: form.description.into_inner(),
+        name: form.name.into_inner(),
+        tags: form
+            .tags
+            .into_inner()
+            .split_terminator(',')
+            .into_iter()
+            .map(|s| s.to_owned())
+            .collect(),
+        last_modified: OffsetDateTime::now_utc().into(),
+        version: form.version.into_inner(),
     };
 
-    let pack = db::create_pack(&tables, pack).await?;
+    // Create pack metadata
+    db::create_pack(&tables, &blobs, pack).await?;
 
-    Ok(created(req, &pack_id, pack))
+    // Upload pack data in the bg
+    tokio::spawn(async move {
+        match db::upload_zipped_pack(&blobs, form.file, &slug).await {
+            Ok(_) => {}
+            Err(e) => {
+                log::error!("error uploading zip file for {}: {}", &slug, e);
+                return;
+            }
+        }
+    });
+
+    Ok(HttpResponse::Accepted())
+}
+
+#[patch("packs/{pack_id}")]
+async fn update_pack(
+    tables: web::Data<TableServiceClient>,
+    pack_id: web::Path<String>,
+    patch: web::Json<UpdatePack>,
+) -> Result<impl Responder> {
+    let pack_id = pack_id.into_inner();
+    let patch = patch.into_inner();
+
+    tables
+        .table_client("packs")
+        .partition_key_client(&pack_id)
+        .entity_client(&pack_id)?
+        .merge(patch, azure_data_tables::IfMatchCondition::Any)?
+        .await?;
+
+    Ok(HttpResponse::Ok().finish())
 }
 
 #[delete("packs/{pack_id}")]
 async fn delete_pack(
-    worker_queue: web::Data<Sender<Order>>,
+    tables: web::Data<TableServiceClient>,
+    blobs: web::Data<BlobServiceClient>,
     pack_id: web::Path<String>,
 ) -> Result<impl Responder> {
     let pack_id = pack_id.into_inner();
 
-    worker_queue.send(Order::DeletePack(pack_id)).await?;
+    db::delete_pack(&tables, &blobs, pack_id).await?;
 
     Ok(HttpResponse::Accepted().finish())
-}
-
-#[get("packs/{pack_id}/assets")]
-async fn get_pack_assets(
-    tables: web::Data<TableServiceClient>,
-    pack_id: web::Path<String>,
-) -> Result<impl Responder> {
-    let pack_id = pack_id.into_inner();
-    let pages: Vec<_> = tables
-        .table_client("assets")
-        .query()
-        .filter(format!("PartitionKey eq '{}'", pack_id))
-        .into_stream::<db::Asset>()
-        .try_collect()
-        .await?;
-
-    let assets: Vec<Asset> = pages
-        .into_iter()
-        .flat_map(|p| p.entities)
-        .map(|a| a.into())
-        .collect();
-    Ok(HttpResponse::Ok().json(assets))
 }
 
 #[get("assets/{asset_id}/blob")]
@@ -131,18 +173,4 @@ async fn download_asset(
         .unwrap_or(asset_id);
 
     Ok(download(&file_name, content))
-}
-
-#[post("assets")]
-async fn upload_asset(
-    req: HttpRequest,
-    tables: web::Data<TableServiceClient>,
-    blobs: web::Data<BlobServiceClient>,
-    MultipartForm(form): MultipartForm<UploadAsset>,
-) -> Result<impl Responder> {
-    let pack_id = form.pack_id.into_inner();
-    let asset_id = uuid::Uuid::new_v4().to_string();
-
-    let asset = db::upload_asset(&tables, &blobs, form.file, &pack_id, &asset_id).await?;
-    Ok(created(req, &asset_id, asset))
 }

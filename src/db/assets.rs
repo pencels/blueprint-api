@@ -2,16 +2,11 @@ use std::io::Read;
 
 use crate::util::Result;
 use actix_multipart::form::tempfile::TempFile;
-use azure_core::request_options::Metadata;
-use azure_data_tables::{
-    operations::InsertEntityResponse,
-    prelude::{PartitionKeyClient, TableServiceClient},
-};
+use azure_data_tables::{operations::InsertEntityResponse, prelude::TableServiceClient};
 use azure_storage_blobs::prelude::BlobServiceClient;
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
-use super::get_entities;
+use super::{get_entities, DateTime};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Asset {
@@ -19,6 +14,7 @@ pub struct Asset {
     pub partition_key: String,
     #[serde(rename = "RowKey")]
     pub row_key: String,
+    pub slug: String,
     pub file_name: String,
     pub content_type: Option<String>,
 }
@@ -29,19 +25,24 @@ pub struct AssetPack {
     pub partition_key: String,
     #[serde(rename = "RowKey")]
     pub row_key: String,
+    #[serde(rename = "Timestamp", skip_serializing)]
+    pub last_modified: DateTime,
     pub name: String,
     pub description: String,
     pub tags: String,
+    pub version: String,
 }
 
 impl From<crate::models::AssetPack> for AssetPack {
     fn from(pack: crate::models::AssetPack) -> Self {
         Self {
-            partition_key: pack.id.clone(),
-            row_key: pack.id,
+            partition_key: pack.slug.to_string(),
+            row_key: pack.slug,
             name: pack.name,
             description: pack.description,
             tags: pack.tags.join(","),
+            last_modified: pack.last_modified,
+            version: pack.version,
         }
     }
 }
@@ -49,20 +50,12 @@ impl From<crate::models::AssetPack> for AssetPack {
 impl From<AssetPack> for crate::models::AssetPack {
     fn from(value: AssetPack) -> Self {
         Self {
-            id: value.row_key,
             name: value.name,
             description: value.description,
             tags: value.tags.split_terminator(",").map(String::from).collect(),
-        }
-    }
-}
-
-impl From<Asset> for crate::models::Asset {
-    fn from(value: Asset) -> Self {
-        Self {
-            id: value.row_key,
-            pack_id: value.partition_key,
-            file_name: value.file_name,
+            slug: value.row_key,
+            last_modified: value.last_modified,
+            version: value.version,
         }
     }
 }
@@ -76,9 +69,29 @@ pub async fn get_packs(
 
 pub async fn create_pack(
     tables: &TableServiceClient,
+    blobs: &BlobServiceClient,
     pack: crate::models::AssetPack,
 ) -> crate::util::Result<crate::models::AssetPack> {
     let pack: AssetPack = pack.into();
+
+    let get_result = tables
+        .table_client("packs")
+        .partition_key_client(&pack.partition_key)
+        .entity_client(&pack.row_key)?
+        .get::<GenericRowKeyEntity>()
+        .await;
+
+    if get_result.is_ok() {
+        Err(format!(
+            "Cannot create '{}' as it already exists",
+            pack.row_key
+        ))?
+    }
+
+    let cont = blobs.container_client(format!("pack-{}", pack.row_key));
+    if !cont.exists().await? {
+        cont.create().await?;
+    }
 
     let response: InsertEntityResponse<AssetPack> = tables
         .table_client("packs")
@@ -92,54 +105,32 @@ pub async fn create_pack(
         .ok_or("Pack create failed".into())
 }
 
-pub async fn upload_asset(
-    tables: &TableServiceClient,
+pub async fn upload_zipped_pack(
     blobs: &BlobServiceClient,
-    mut file_metadata: TempFile,
-    pack_id: &str,
-    asset_id: &str,
-) -> crate::util::Result<crate::models::Asset> {
-    let file_name = file_metadata
-        .file_name
-        .as_ref()
-        .map(|name| name.split_once('/').map_or(name.as_str(), |(_, path)| path))
-        .map_or_else(|| pack_id.to_string(), |s| s.to_string());
-    let content_type_string = file_metadata
-        .content_type
-        .as_ref()
-        .unwrap_or(&mime::APPLICATION_OCTET_STREAM)
-        .to_string();
+    file_metadata: TempFile,
+    pack_slug: &str,
+) -> crate::util::Result<()> {
+    let mut zip = zip::ZipArchive::new(file_metadata.file)?;
 
-    let mut data = Vec::new();
-    file_metadata.file.read_to_end(&mut data)?;
+    for index in 0..zip.len() {
+        let mut buf = Vec::new();
+        let name = {
+            let mut file = zip.by_index(index)?;
+            file.read_to_end(&mut buf)?;
+            let name = file
+                .enclosed_name()
+                .ok_or_else(|| format!("zip file escapes archive: {}", file.name()))?;
+            name.as_os_str().to_string_lossy().to_string()
+        };
 
-    let mut metadata = Metadata::new();
-    metadata.insert("file_name", file_name.clone());
-    metadata.insert("pack_id", pack_id.to_string());
+        blobs
+            .container_client(format!("pack-{}", pack_slug))
+            .blob_client(name)
+            .put_block_blob(buf)
+            .await?;
+    }
 
-    blobs
-        .container_client("assets")
-        .blob_client(asset_id)
-        .put_block_blob(data)
-        .metadata(metadata)
-        .content_type(content_type_string)
-        .await?;
-
-    let asset = Asset {
-        partition_key: pack_id.to_string(),
-        row_key: asset_id.to_string(),
-        file_name,
-        content_type: file_metadata.content_type.map(|t| t.to_string()),
-    };
-
-    tables
-        .table_client("assets")
-        .partition_key_client(pack_id)
-        .entity_client(asset_id)?
-        .insert_or_replace(&asset)?
-        .await?;
-
-    Ok(asset.into())
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -148,42 +139,21 @@ struct GenericRowKeyEntity {
     row_key: String,
 }
 
-async fn delete_asset(blobs: &BlobServiceClient, partition: &PartitionKeyClient, row_key: &str) {
-    log::info!("deleting = {}", row_key);
-    let _ = blobs
-        .container_client("assets")
-        .blob_client(row_key)
+pub async fn delete_pack(
+    tables: &TableServiceClient,
+    blobs: &BlobServiceClient,
+    pack_id: String,
+) -> Result<()> {
+    blobs
+        .container_client(format!("pack-{}", &pack_id))
         .delete()
-        .await;
-    let _ = partition.entity_client(row_key).unwrap().delete().await;
-}
-
-pub async fn delete_pack(tables: &TableServiceClient, blobs: &BlobServiceClient, pack_id: String) {
-    let pack_id = pack_id.as_str();
-    // Delete associated assets
-    let partition = tables.table_client("assets").partition_key_client(pack_id);
-    let mut stream = tables
-        .table_client("assets")
-        .query()
-        .filter(format!("PartitionKey eq '{}'", &pack_id))
-        .select("RowKey")
-        .into_stream::<GenericRowKeyEntity>();
-
-    while let Some(res) = stream.next().await {
-        let res = res.unwrap();
-        let row_keys: Vec<_> = res.entities.iter().map(|e| e.row_key.to_string()).collect();
-
-        for key in row_keys {
-            delete_asset(blobs, &partition, &key).await;
-        }
-    }
-
-    // Delete pack entry
-    let _ = tables
+        .await?;
+    tables
         .table_client("packs")
-        .partition_key_client(pack_id)
-        .entity_client(pack_id)
-        .unwrap()
+        .partition_key_client(&pack_id)
+        .entity_client(&pack_id)?
         .delete()
-        .await;
+        .await?;
+
+    Ok(())
 }

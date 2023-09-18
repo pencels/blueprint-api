@@ -1,16 +1,13 @@
 use serde::{Deserialize, Serialize};
 
+use crate::db::DateTime;
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AssetPack {
-    pub id: String,
+    pub slug: String,
     pub name: String,
     pub description: String,
     pub tags: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Asset {
-    pub id: String,
-    pub pack_id: String,
-    pub file_name: String,
+    pub last_modified: DateTime,
+    pub version: String,
 }

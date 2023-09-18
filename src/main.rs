@@ -24,15 +24,10 @@ pub const STORAGE_ACCOUNT_NAME: &str = "blueprintstore";
 pub const STORAGE_ACCOUNT_KEY_NAME: &str = "blueprintstore-key";
 pub const KEYVAULT_URI: &str = "https://blueprint-kv.vault.azure.net/";
 const NUM_TEMPLATE_WORKERS: usize = 10;
-const NUM_GENERIC_WORKERS: usize = 10;
 
 #[get("/")]
 async fn index() -> impl Responder {
     "hi"
-}
-
-pub enum Order {
-    DeletePack(String),
 }
 
 #[actix_web::main]
@@ -69,35 +64,21 @@ async fn main() -> std::io::Result<()> {
         });
     }
 
-    let (worker_queue, recv) = async_channel::unbounded::<Order>();
-    for _ in 0..NUM_GENERIC_WORKERS {
-        let table_service = table_service.clone();
-        let blob_service = blob_service.clone();
-        let recv = recv.clone();
-        tokio::spawn(async move {
-            loop {
-                let order = recv.recv().await.expect("channel closed unexpectedly");
-                match order {
-                    Order::DeletePack(pack_id) => {
-                        db::delete_pack(&table_service, &blob_service, pack_id).await;
-                    }
-                }
-            }
-        });
-    }
-
     HttpServer::new(move || {
         let cors = Cors::default()
             .allowed_origin("http://localhost:4321")
-            .allowed_methods(vec!["GET", "POST"]);
+            .allowed_methods(vec!["GET", "POST", "DELETE"]);
         App::new()
             .wrap(Logger::default())
             .wrap(cors)
             .wrap(middleware::Compress::default())
             .app_data(web::Data::new(template_queue.clone()))
-            .app_data(web::Data::new(worker_queue.clone()))
             .app_data(web::Data::new(table_service.clone()))
             .app_data(web::Data::new(blob_service.clone()))
+            .app_data(
+                actix_multipart::form::MultipartFormConfig::default()
+                    .total_limit(1024 * 1024 * 200),
+            )
             .configure(routes::v1::config)
             .service(index)
     })
