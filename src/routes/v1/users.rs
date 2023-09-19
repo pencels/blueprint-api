@@ -1,5 +1,4 @@
 use actix_web::{delete, get, patch, post, web, HttpRequest, HttpResponse, Responder};
-use azure_data_tables::prelude::TableServiceClient;
 use validator::Validate;
 
 use crate::{
@@ -19,32 +18,31 @@ pub fn config(cfg: &mut actix_web::web::ServiceConfig) {
 
 #[get("users")]
 pub async fn get_users(
-    client: web::Data<TableServiceClient>,
+    client: web::Data<mongodb::Client>,
     info: web::Query<Paginated>,
 ) -> Result<impl Responder> {
     let query = info.into_inner();
     query.validate()?;
     let page = query.page;
     let results = db::get_users(&client, page.unwrap_or(1)).await?;
-    match results {
-        Some(results) => Ok(HttpResponse::Ok().json(results)),
-        None => Ok(HttpResponse::NotFound().finish()),
-    }
+    Ok(HttpResponse::Ok().json(results))
 }
 
 #[post("users")]
 pub async fn add_user(
     req: HttpRequest,
-    client: web::Data<TableServiceClient>,
+    client: web::Data<mongodb::Client>,
     body: web::Json<NewUser>,
 ) -> Result<impl Responder> {
-    let user = db::create_new_user(&client, body.into_inner()).await?;
-    Ok(created(req, &user.id, &user))
+    let body = body.into_inner();
+    let username = body.username.clone();
+    let user = db::create_new_user(&client, body).await?;
+    Ok(created(req, &username, &user))
 }
 
 #[get("users/{id}")]
 pub async fn get_user(
-    client: web::Data<TableServiceClient>,
+    client: web::Data<mongodb::Client>,
     id: web::Path<String>,
 ) -> Result<impl Responder> {
     let user = db::get_user(&client, &id).await?;
@@ -53,7 +51,7 @@ pub async fn get_user(
 
 #[patch("users/{id}")]
 pub async fn update_user(
-    client: web::Data<TableServiceClient>,
+    client: web::Data<mongodb::Client>,
     id: web::Path<String>,
     update: web::Json<UpdateUser>,
 ) -> Result<impl Responder> {
@@ -64,7 +62,7 @@ pub async fn update_user(
 
 #[delete("users/{id}")]
 pub async fn delete_user(
-    client: web::Data<TableServiceClient>,
+    client: web::Data<mongodb::Client>,
     id: web::Path<String>,
 ) -> Result<impl Responder> {
     db::delete_user(&client, &id).await?;

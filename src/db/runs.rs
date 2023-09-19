@@ -1,22 +1,14 @@
+use bson::Bson;
 use serde::{Deserialize, Serialize};
 
 use super::DateTime;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CompositorRun {
-    #[serde(rename = "PartitionKey")]
-    pub partition_key: String,
-    #[serde(rename = "RowKey")]
-    pub row_key: String,
-    #[serde(
-        rename = "created@odata.type",
-        serialize_with = "super::edm_datetime",
-        skip_deserializing
-    )]
-    pub _created_tag: (),
+    #[serde(rename = "_id", skip_serializing)]
+    pub id: bson::oid::ObjectId,
     pub created: DateTime,
     pub status: CompositorRunStatus,
-    pub progress: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
@@ -26,12 +18,21 @@ pub enum CompositorRunStatus {
     Failed,
 }
 
+impl From<CompositorRunStatus> for Bson {
+    fn from(value: CompositorRunStatus) -> Self {
+        match value {
+            CompositorRunStatus::Running => Bson::String("running".to_string()),
+            CompositorRunStatus::Succeeded => Bson::String("succeeded".to_string()),
+            CompositorRunStatus::Failed => Bson::String("failed".to_string()),
+        }
+    }
+}
+
 impl From<CompositorRun> for crate::models::CompositorRun {
     fn from(value: CompositorRun) -> Self {
         Self {
-            id: value.row_key,
+            id: value.id.to_string(),
             created: value.created,
-            progress: value.progress,
             status: value.status,
         }
     }
@@ -40,12 +41,9 @@ impl From<CompositorRun> for crate::models::CompositorRun {
 impl From<crate::models::CompositorRun> for CompositorRun {
     fn from(value: crate::models::CompositorRun) -> Self {
         Self {
-            partition_key: value.id.clone(),
-            row_key: value.id,
-            _created_tag: (),
+            id: Default::default(),
             created: value.created,
             status: value.status,
-            progress: value.progress,
         }
     }
 }

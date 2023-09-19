@@ -7,5 +7,4 @@ pub struct CompositorRun {
     pub id: String,
     pub created: DateTime,
     pub status: CompositorRunStatus,
-    pub progress: u32,
 }

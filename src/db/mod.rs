@@ -1,14 +1,12 @@
 mod users;
-use azure_data_tables::prelude::TableServiceClient;
+use bson::doc;
 use futures::StreamExt;
-use rand::Rng;
 pub use users::*;
 mod assets;
 pub use assets::*;
 mod runs;
 pub use runs::*;
 
-use crate::util::Result;
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU8;
 
@@ -19,6 +17,8 @@ use time::{
     },
     OffsetDateTime,
 };
+
+const PAGE_SIZE: u32 = 25;
 const FORMAT: Iso8601<6651332276410551414894041209048662016> = Iso8601::<
     {
         iso8601::Config::DEFAULT
@@ -63,29 +63,31 @@ impl From<DateTime> for OffsetDateTime {
 }
 
 pub async fn get_entities<T, U>(
-    client: &TableServiceClient,
+    client: &mongodb::Client,
     table_name: &str,
     page: usize,
-) -> crate::util::Result<Option<Vec<U>>>
+) -> crate::util::Result<Vec<U>>
 where
     T: for<'a> Deserialize<'a> + Send + Sync,
     U: From<T>,
 {
     // Skip to the desired page in the stream
-    let page = client
-        .table_client(table_name)
-        .query()
-        .into_stream::<T>()
-        .skip(page - 1)
-        .next()
-        .await;
+    let cursor = client
+        .default_database()
+        .unwrap()
+        .collection::<T>(table_name)
+        .aggregate(
+            [
+                doc! { "$skip": (page - 1) as u32 * PAGE_SIZE },
+                doc! { "$limit": PAGE_SIZE },
+            ],
+            None,
+        )
+        .await?;
 
-    // Map the page results to the output type
-    Ok(page.transpose()?.map(|response| {
-        response
-            .entities
-            .into_iter()
-            .map(|e| e.into())
-            .collect::<Vec<_>>()
-    }))
+    let page: Vec<_> = cursor.with_type::<T>().collect().await;
+    let page: Result<Vec<U>, mongodb::error::Error> =
+        page.into_iter().map(|r| r.map(|p| p.into())).collect();
+
+    Ok(page?)
 }

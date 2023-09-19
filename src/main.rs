@@ -6,7 +6,6 @@ use actix_web::{
     middleware::{self, Logger},
     web, App, HttpServer, Responder,
 };
-use azure_data_tables::prelude::TableServiceClient;
 use azure_identity::DefaultAzureCredential;
 use azure_security_keyvault::KeyvaultClient;
 use azure_storage::StorageCredentials;
@@ -20,9 +19,10 @@ mod models;
 mod routes;
 mod util;
 
-pub const STORAGE_ACCOUNT_NAME: &str = "blueprintstore";
-pub const STORAGE_ACCOUNT_KEY_NAME: &str = "blueprintstore-key";
-pub const KEYVAULT_URI: &str = "https://blueprint-kv.vault.azure.net/";
+const STORAGE_ACCOUNT_NAME: &str = "blueprintstore";
+const STORAGE_ACCOUNT_KEY_NAME: &str = "blueprintstore-key";
+const DB_CONN_STRING_NAME: &str = "blueprintdb-connstring";
+const KEYVAULT_URI: &str = "https://blueprint-kv.vault.azure.net/";
 const NUM_TEMPLATE_WORKERS: usize = 10;
 
 #[get("/")]
@@ -41,24 +41,34 @@ async fn main() -> std::io::Result<()> {
         .get(STORAGE_ACCOUNT_KEY_NAME)
         .await
         .unwrap();
+    let db_conn_string = kv_client
+        .secret_client()
+        .get(DB_CONN_STRING_NAME)
+        .await
+        .unwrap()
+        .value;
 
     let cred = StorageCredentials::access_key(STORAGE_ACCOUNT_NAME, key.value);
     let blob_service = BlobServiceClient::new(STORAGE_ACCOUNT_NAME, cred.clone());
-    let table_service = TableServiceClient::new(STORAGE_ACCOUNT_NAME, cred.clone());
+    let mut db_client_options = mongodb::options::ClientOptions::parse(db_conn_string)
+        .await
+        .unwrap();
+    db_client_options.default_database = Some(String::from("db"));
+    let db_client = mongodb::Client::with_options(db_client_options).unwrap();
 
-    let compositor = Compositor::new(table_service.clone(), blob_service.clone());
+    let compositor = Compositor::new(db_client.clone(), blob_service.clone());
 
     // Template processing
-    let (template_queue, recv) = async_channel::unbounded::<(String, Template)>();
+    let (template_queue, recv) = async_channel::unbounded::<Template>();
     for _ in 0..NUM_TEMPLATE_WORKERS {
         let compositor = compositor.clone();
         let recv = recv.clone();
         tokio::spawn(async move {
             loop {
-                let (run_id, template) = recv.recv().await.expect("channel closed unexpectedly");
-                match compositor.run_template(&run_id, template).await {
-                    Ok(_) => log::info!("template run {} succeeded", &run_id),
-                    Err(e) => log::error!("template run {} failed: {}", &run_id, e),
+                let template = recv.recv().await.expect("channel closed unexpectedly");
+                match compositor.run_template(template).await.unwrap() {
+                    (run_id, Ok(_)) => log::info!("template run {} succeeded", &run_id),
+                    (run_id, Err(e)) => log::error!("template run {} failed: {}", &run_id, e),
                 };
             }
         });
@@ -73,8 +83,8 @@ async fn main() -> std::io::Result<()> {
             .wrap(cors)
             .wrap(middleware::Compress::default())
             .app_data(web::Data::new(template_queue.clone()))
-            .app_data(web::Data::new(table_service.clone()))
             .app_data(web::Data::new(blob_service.clone()))
+            .app_data(web::Data::new(db_client.clone()))
             .app_data(
                 actix_multipart::form::MultipartFormConfig::default()
                     .total_limit(1024 * 1024 * 200),

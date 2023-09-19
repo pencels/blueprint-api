@@ -11,10 +11,10 @@ const POOL_SIZE: usize = 20;
 
 pub struct ImageCache {
     pub inner: LoadingCache<
-        String,
+        (String, String),
         RgbaImage,
         CacheError,
-        LruCacheBacking<String, CacheEntry<RgbaImage, CacheError>>,
+        LruCacheBacking<(String, String), CacheEntry<RgbaImage, CacheError>>,
     >,
 }
 
@@ -33,13 +33,14 @@ impl<E: std::error::Error> From<E> for CacheError {
 
 impl ImageCache {
     pub fn new(blobs: Arc<BlobServiceClient>) -> ImageCache {
-        let inner =
-            LoadingCache::with_backing(LruCacheBacking::new(POOL_SIZE), move |blob_id: String| {
+        let inner = LoadingCache::with_backing(
+            LruCacheBacking::new(POOL_SIZE),
+            move |(pack, path): (String, String)| {
                 let blobs = blobs.clone();
                 async move {
                     let content = blobs
-                        .container_client("assets")
-                        .blob_client(blob_id)
+                        .container_client(format!("pack-{}", pack))
+                        .blob_client(path)
                         .get_content()
                         .await?;
 
@@ -50,7 +51,8 @@ impl ImageCache {
 
                     Ok(image)
                 }
-            });
+            },
+        );
         ImageCache { inner }
     }
 }

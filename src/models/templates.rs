@@ -11,7 +11,7 @@ pub struct Template {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Layer {
-    #[serde(rename = "ref")]
+    #[serde(rename = "use")]
     pub reference: String,
     #[serde(default)]
     pub transform: Transform,
@@ -70,5 +70,32 @@ pub enum BlendMode {
 impl Default for BlendMode {
     fn default() -> Self {
         BlendMode::Normal
+    }
+}
+
+impl Template {
+    pub fn normalize_use_refs(&mut self) {
+        // Insert underscore before existing aliases to avoid name clashes with auto aliases
+        let new_aliases: HashMap<_, _> = self
+            .aliases
+            .drain()
+            .map(|(mut k, v)| {
+                k.insert(1, '_');
+                (k, v)
+            })
+            .collect();
+        self.aliases = new_aliases;
+
+        let mut i = 0;
+        for layer in self.layers.iter_mut() {
+            if layer.reference.starts_with("$") {
+                layer.reference.insert(1, '_');
+            } else {
+                let new_alias = format!("${}", i);
+                let reference = std::mem::replace(&mut layer.reference, new_alias.clone());
+                self.aliases.insert(new_alias, vec![reference]);
+                i += 1;
+            }
+        }
     }
 }

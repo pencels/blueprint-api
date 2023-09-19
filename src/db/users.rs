@@ -1,5 +1,4 @@
-use azure_data_tables::IfMatchCondition;
-use azure_data_tables::{operations::InsertEntityResponse, prelude::TableServiceClient};
+use bson::doc;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -72,61 +71,55 @@ impl From<NewUser> for User {
 
 // User Table API Functions
 
-pub async fn create_new_user(
-    client: &TableServiceClient,
-    new_user: NewUser,
-) -> Result<crate::models::User> {
+pub async fn create_new_user(client: &mongodb::Client, new_user: NewUser) -> Result<()> {
     let user: User = new_user.into();
 
-    let response: InsertEntityResponse<User> = client
-        .table_client(USERS_TABLE)
-        .insert(&user)?
-        .return_entity(true)
-        .await?;
-
-    response
-        .entity_with_metadata
-        .map(|e| e.entity.into())
-        .ok_or("User create failed".into())
-}
-
-pub async fn get_users(
-    client: &TableServiceClient,
-    page: usize,
-) -> Result<Option<Vec<crate::models::User>>> {
-    get_entities::<User, crate::models::User>(client, USERS_TABLE, page).await
-}
-
-pub async fn get_user(client: &TableServiceClient, id: &str) -> Result<crate::models::User> {
-    let response = client
-        .table_client(USERS_TABLE)
-        .partition_key_client(id)
-        .entity_client(id)?
-        .get::<User>()
-        .await?;
-    Ok(response.entity.into())
-}
-
-pub async fn update_user(
-    client: &TableServiceClient,
-    id: &str,
-    update: UpdateUser,
-) -> azure_core::Result<()> {
     client
-        .table_client(USERS_TABLE)
-        .partition_key_client(id)
-        .entity_client(id)?
-        .merge(update, IfMatchCondition::Any)?
+        .default_database()
+        .unwrap()
+        .collection::<User>(USERS_TABLE)
+        .insert_one(&user, None)
         .await?;
+
     Ok(())
 }
 
-pub async fn delete_user(client: &TableServiceClient, id: &str) -> azure_core::Result<()> {
+pub async fn get_users(client: &mongodb::Client, page: usize) -> Result<Vec<crate::models::User>> {
+    get_entities::<User, crate::models::User>(client, USERS_TABLE, page).await
+}
+
+pub async fn get_user(client: &mongodb::Client, id: &str) -> Result<Option<crate::models::User>> {
+    let response = client
+        .default_database()
+        .unwrap()
+        .collection::<User>(USERS_TABLE)
+        .find_one(doc! { "_id": id }, None)
+        .await?;
+    Ok(response.map(|e| e.into()))
+}
+
+pub async fn update_user(client: &mongodb::Client, id: &str, update: UpdateUser) -> Result<()> {
+    let modifications = doc! {
+        "username": update.username,
+        "display_name": update.display_name,
+    };
+
     client
-        .table_client(USERS_TABLE)
-        .partition_key_client(id)
-        .entity_client(id)?
-        .delete()
+        .default_database()
+        .unwrap()
+        .collection::<User>(USERS_TABLE)
+        .update_one(doc! { "_id": id }, modifications, None)
+        .await?;
+
+    Ok(())
+}
+
+pub async fn delete_user(client: &mongodb::Client, id: &str) -> Result<()> {
+    client
+        .default_database()
+        .unwrap()
+        .collection::<User>(USERS_TABLE)
+        .delete_one(doc! { "_id": id }, None)
         .await?;
     Ok(())
 }

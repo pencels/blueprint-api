@@ -1,19 +1,20 @@
+use std::borrow::Borrow;
 use std::collections::HashMap;
+use std::slice;
 use std::sync::Arc;
-use std::{iter, slice};
 
-use azure_data_tables::operations::InsertEntityResponse;
-use azure_data_tables::prelude::TableServiceClient;
 use azure_storage_blobs::prelude::BlobServiceClient;
+use bson::oid::ObjectId;
 use futures::TryStreamExt;
 use image::codecs::png::PngEncoder;
 use image::imageops::FilterType;
 use image::{imageops, RgbaImage};
 use imageproc::geometric_transformations::Interpolation;
-use itertools::{Either, Itertools, MultiProduct};
+use itertools::{Itertools, MultiProduct};
+use mongodb::bson::doc;
 use time::OffsetDateTime;
 
-use crate::db::{Asset, CompositorRun, CompositorRunStatus, DateTime};
+use crate::db::{CompositorRun, CompositorRunStatus};
 use crate::models::{Degrees, Scale, Template};
 use crate::util::Result;
 
@@ -21,23 +22,20 @@ use super::image_cache::ImageCache;
 
 #[derive(Debug, Clone)]
 pub struct Compositor {
-    table_client: TableServiceClient,
+    db: mongodb::Client,
     blob_client: BlobServiceClient,
 }
 
 impl Compositor {
-    pub fn new(table_client: TableServiceClient, blob_client: BlobServiceClient) -> Compositor {
-        Compositor {
-            table_client,
-            blob_client,
-        }
+    pub fn new(db: mongodb::Client, blob_client: BlobServiceClient) -> Compositor {
+        Compositor { db, blob_client }
     }
 
     pub async fn apply_template_instance(
         &self,
         template: &Template,
         image_cache: &ImageCache,
-        aliases: &HashMap<&str, &String>,
+        aliases: &HashMap<&String, &(&str, String)>,
     ) -> Result<RgbaImage> {
         let (w, h) = (template.canvas_size.0, template.canvas_size.1);
         let mut canvas = RgbaImage::new(w, h);
@@ -46,8 +44,11 @@ impl Compositor {
         }
 
         for layer_spec in &template.layers {
-            let asset_id = aliases.get(&layer_spec.reference.as_str()).unwrap();
-            let layer = image_cache.inner.get(asset_id.to_string()).await?;
+            let (pack, path) = aliases.get(&&layer_spec.reference).unwrap();
+            let layer = image_cache
+                .inner
+                .get((pack.to_string(), path.to_string()))
+                .await?;
             let layer = scale(&layer, layer_spec.transform.scale);
             let mut layer = rot(&layer, layer_spec.transform.rotate);
             for pixel in layer.pixels_mut() {
@@ -67,35 +68,43 @@ impl Compositor {
         Ok(canvas)
     }
 
-    pub async fn run_template(&self, run_id: &str, mut template: Template) -> Result<()> {
+    pub async fn run_template(&self, template: Template) -> Result<(ObjectId, Result<()>)> {
+        let runs_coll = self
+            .db
+            .default_database()
+            .unwrap()
+            .collection::<CompositorRun>("runs");
+        let run = CompositorRun {
+            id: Default::default(),
+            created: OffsetDateTime::now_utc().into(),
+            status: CompositorRunStatus::Running,
+        };
+        let result = runs_coll.insert_one(&run, None).await?;
+        let id = result.inserted_id.as_object_id().unwrap();
+        Ok((id, self.run_template_internal(id, template).await))
+    }
+
+    pub async fn run_template_internal(
+        &self,
+        run_id: ObjectId,
+        mut template: Template,
+    ) -> Result<()> {
+        let runs_coll = self
+            .db
+            .default_database()
+            .unwrap()
+            .collection::<CompositorRun>("runs");
         let output = self.blob_client.container_client("template-output");
 
-        let run_entity = self
-            .table_client
-            .table_client("runs")
-            .partition_key_client(run_id)
-            .entity_client(run_id)?;
-
-        let mut run = CompositorRun {
-            partition_key: run_id.to_string(),
-            row_key: run_id.to_string(),
-            created: OffsetDateTime::now_utc().into(),
-            progress: 0,
-            status: CompositorRunStatus::Running,
-            _created_tag: (),
-        };
-        run_entity.insert_or_merge(&run)?.await?;
-
-        for refs in template.aliases.values_mut() {
-            *refs = self.expand_refs(refs.iter()).await?;
+        template.normalize_use_refs();
+        let mut expanded_refs = HashMap::new();
+        for (alias, refs) in template.aliases.iter() {
+            expanded_refs.insert(alias, self.expand_refs(refs.iter()).await?);
         }
 
-        let mut count = 0;
-        let estimated_upper_bound = template.aliases.get("fg").unwrap().len();
-
-        let (vals, iter) = iter_alias_binds(&template.aliases);
+        let (vals, iter) = iter_alias_binds(&expanded_refs);
         for tuple in iter {
-            let pairs = vals.clone().into_iter().zip(tuple);
+            let pairs = vals.iter().zip(tuple).map(|(k, v)| (*k, v));
             let aliases = HashMap::from_iter(pairs);
 
             let image_cache = ImageCache::new(Arc::new(self.blob_client.clone()));
@@ -107,19 +116,8 @@ impl Compositor {
             let mut buf = Vec::new();
             result.write_with_encoder(PngEncoder::new(&mut buf))?;
 
-            let file_name = match aliases.get(&"fg") {
-                Some(id) => {
-                    let meta = self
-                        .blob_client
-                        .container_client("assets")
-                        .blob_client(*id)
-                        .get_metadata()
-                        .await?;
-                    meta.metadata
-                        .get("file_name")
-                        .and_then(|n| String::from_utf8(n.into()).ok())
-                        .unwrap_or_else(|| format!("{}.png", id))
-                }
+            let file_name = match aliases.get(&"$_fg".to_string()) {
+                Some((_, path)) => path,
                 None => panic!("erm"),
             };
             let relative_blob_name = run_id.to_string() + "/" + &file_name;
@@ -128,52 +126,72 @@ impl Compositor {
                 .put_block_blob(buf)
                 .await?;
 
-            count += 1;
+            let modifications = doc! {
+                "$set": {
+                    "status": CompositorRunStatus::Running,
+                }
+            };
 
-            run.progress = (count * 100 / estimated_upper_bound) as u32;
-            run_entity.insert_or_merge(&run)?.await?;
+            runs_coll
+                .update_one(doc! { "_id": &run_id }, modifications, None)
+                .await?;
         }
 
-        run.progress = 100;
-        run.status = CompositorRunStatus::Succeeded;
-        run_entity.insert_or_merge(&run)?.await?;
+        let modifications = doc! {
+            "$set": {
+                "status": CompositorRunStatus::Succeeded,
+            }
+        };
+        runs_coll
+            .update_one(doc! { "_id": &run_id }, modifications, None)
+            .await?;
         Ok(())
     }
 
-    async fn get_pack_asset_ids(&self, pack_id: &str) -> Result<impl Iterator<Item = String>> {
-        let resp: Vec<_> = self
-            .table_client
-            .table_client("assets")
-            .query()
-            .filter(format!("PartitionKey eq '{}'", pack_id))
-            .into_stream::<Asset>()
-            .try_collect()
-            .await?;
+    async fn match_paths_to_glob<'a>(
+        &self,
+        pack_id: &'a str,
+        glob: &str,
+    ) -> Result<impl IntoIterator<Item = (&'a str, String)>> {
+        let matcher = globset::Glob::new(glob)?.compile_matcher();
+        let mut blobs = self
+            .blob_client
+            .container_client(format!("pack-{}", pack_id))
+            .list_blobs()
+            .into_stream();
 
-        let asset_ids = resp
-            .into_iter()
-            .flat_map(|res| res.entities)
-            .map(|asset| asset.row_key);
+        let mut results = Vec::new();
+        while let Some(page) = blobs.try_next().await? {
+            for blob in page.blobs.blobs() {
+                if matcher.is_match(&blob.name) {
+                    results.push((pack_id, blob.name.to_string()));
+                }
+            }
+        }
 
-        Ok(asset_ids)
+        Ok(results)
     }
 
-    async fn expand_ref<S>(&self, item: S) -> Result<impl Iterator<Item = String>>
+    async fn expand_ref<'a, S>(
+        &self,
+        item: &'a S,
+    ) -> Result<impl IntoIterator<Item = (&'a str, String)>>
     where
-        S: AsRef<str>,
+        S: Borrow<str> + 'a,
     {
-        let item = item.as_ref();
-        let iter = match item.split_once(':') {
-            Some(("pack", id)) => Either::Left(self.get_pack_asset_ids(id).await?),
-            Some((ref_type, _)) => Err(format!("unrecognized reference type: {}", ref_type))?,
-            None => Either::Right(iter::once(item.to_string())),
+        let iter = match item.borrow().split_once(':') {
+            Some((slug, glob)) => self.match_paths_to_glob(slug, glob).await?,
+            None => Err(format!("reference is missing pack slug: {}", item.borrow()))?,
         };
         Ok(iter)
     }
 
-    async fn expand_refs<S>(&self, refs: impl Iterator<Item = S>) -> Result<Vec<String>>
+    async fn expand_refs<'a, S>(
+        &self,
+        refs: impl Iterator<Item = &'a S>,
+    ) -> Result<Vec<(&'a str, String)>>
     where
-        S: AsRef<str>,
+        S: Borrow<str> + 'a,
     {
         let futs = refs.map(|item| self.expand_ref(item));
 
@@ -187,12 +205,15 @@ impl Compositor {
 }
 
 /// Returns an iterator over all the possible alias bindings for the given mapping.
-pub fn iter_alias_binds(
-    aliases: &HashMap<String, Vec<String>>,
-) -> (Vec<&str>, MultiProduct<slice::Iter<String>>) {
-    let (keys, values): (Vec<_>, Vec<_>) = aliases.iter().unzip();
+pub fn iter_alias_binds<'a, 'b>(
+    aliases: &'b HashMap<&'a String, Vec<(&'a str, String)>>,
+) -> (
+    Vec<&'a String>,
+    MultiProduct<slice::Iter<'b, (&'a str, String)>>,
+) {
+    let (keys, values): (Vec<&'a String>, Vec<_>) = aliases.iter().unzip();
     let result = values.iter().map(|v| *v).multi_cartesian_product();
-    (keys.iter().map(|s| s.as_str()).collect(), result)
+    (keys, result)
 }
 
 fn copy_to_center(src: &RgbaImage, dest: &mut RgbaImage) {

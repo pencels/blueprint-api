@@ -36,13 +36,13 @@ impl From<TemplateRequest> for Template {
 
 #[post("compositor")]
 async fn run_template(
-    queue: web::Data<Sender<(String, Template)>>,
+    queue: web::Data<Sender<Template>>,
     template: web::Json<TemplateRequest>,
 ) -> Result<impl Responder> {
     let run_id = uuid::Uuid::new_v4().to_string();
     let template: Template = template.into_inner().into();
 
-    queue.send((run_id.clone(), template)).await?;
+    queue.send(template).await?;
 
     Ok(HttpResponse::Accepted().json(TemplateRun { run_id }))
 }

@@ -1,9 +1,9 @@
 use std::io::{Cursor, Write};
 
-use crate::{db, models::CompositorRun, util::Result};
+use crate::{models::CompositorRun, util::Result};
 use actix_web::{get, http::header, web, HttpResponse, Responder};
-use azure_data_tables::prelude::TableServiceClient;
 use azure_storage_blobs::prelude::BlobServiceClient;
+use bson::doc;
 use futures::TryStreamExt;
 use zip::write::FileOptions;
 
@@ -13,20 +13,21 @@ pub fn config(cfg: &mut actix_web::web::ServiceConfig) {
 
 #[get("runs/{run_id}")]
 pub async fn get_run(
-    table: web::Data<TableServiceClient>,
+    db: web::Data<mongodb::Client>,
     run_id: web::Path<String>,
 ) -> Result<impl Responder> {
     let run_id = run_id.into_inner();
-    let response = table
-        .table_client("runs")
-        .partition_key_client(&run_id)
-        .entity_client(&run_id)?
-        .get::<db::CompositorRun>()
+    let response = db
+        .default_database()
+        .unwrap()
+        .collection::<CompositorRun>("runs")
+        .find_one(doc! { "_id": &run_id }, None)
         .await?;
 
-    let run: CompositorRun = response.entity.into();
-
-    Ok(HttpResponse::Ok().json(run))
+    match response {
+        Some(run) => Ok(HttpResponse::Ok().json(run)),
+        None => Ok(HttpResponse::NotFound().finish()),
+    }
 }
 
 #[get("runs/{run_id}/zip")]

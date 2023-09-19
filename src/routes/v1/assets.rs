@@ -6,8 +6,8 @@ use actix_web::{
     web::{self, Json},
     HttpResponse, Responder,
 };
-use azure_data_tables::prelude::TableServiceClient;
 use azure_storage_blobs::prelude::BlobServiceClient;
+use bson::doc;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -51,40 +51,37 @@ struct UpdatePack {
 
 #[get("packs")]
 async fn get_packs(
-    tables: web::Data<TableServiceClient>,
+    db: web::Data<mongodb::Client>,
     query: web::Query<Paginated>,
 ) -> Result<impl Responder> {
     let page = query.into_inner().page.unwrap_or(1);
-    let packs = db::get_packs(&tables, page).await?;
+    let packs = db::get_packs(&db, page).await?;
     Ok((Json(packs), StatusCode::OK))
 }
 
 #[get("packs/{pack_id}")]
 async fn get_pack(
-    tables: web::Data<TableServiceClient>,
+    db: web::Data<mongodb::Client>,
     slug: web::Path<String>,
 ) -> Result<impl Responder> {
     let slug = slug.into_inner();
 
-    let response = tables
-        .table_client("packs")
-        .partition_key_client(&slug)
-        .entity_client(&slug)?
-        .get::<db::AssetPack>()
-        .await;
+    let response = db
+        .default_database()
+        .unwrap()
+        .collection::<db::AssetPack>("packs")
+        .find_one(doc! { "_id": &slug }, None)
+        .await?;
 
     match response {
-        Ok(response) => {
-            let asset: AssetPack = response.entity.into();
-            Ok(HttpResponse::Ok().json(asset))
-        }
-        Err(_) => Ok(HttpResponse::NotFound().finish()),
+        Some(pack) => Ok(HttpResponse::Ok().json(AssetPack::from(pack))),
+        None => Ok(HttpResponse::NotFound().finish()),
     }
 }
 
 #[post("packs/{pack_id}")]
 async fn create_pack(
-    tables: web::Data<TableServiceClient>,
+    db: web::Data<mongodb::Client>,
     blobs: web::Data<BlobServiceClient>,
     slug: web::Path<String>,
     MultipartForm(form): MultipartForm<UploadPack>,
@@ -105,7 +102,7 @@ async fn create_pack(
     };
 
     // Create pack metadata
-    db::create_pack(&tables, &blobs, pack).await?;
+    db::create_pack(&db, &blobs, pack).await?;
 
     // Upload pack data in the bg
     tokio::spawn(async move {
@@ -123,18 +120,34 @@ async fn create_pack(
 
 #[patch("packs/{pack_id}")]
 async fn update_pack(
-    tables: web::Data<TableServiceClient>,
+    db: web::Data<mongodb::Client>,
     pack_id: web::Path<String>,
     patch: web::Json<UpdatePack>,
 ) -> Result<impl Responder> {
     let pack_id = pack_id.into_inner();
     let patch = patch.into_inner();
 
-    tables
-        .table_client("packs")
-        .partition_key_client(&pack_id)
-        .entity_client(&pack_id)?
-        .merge(patch, azure_data_tables::IfMatchCondition::Any)?
+    let modifications = doc! {
+        "$set": {
+            "slug": &patch.slug,
+            "name": &patch.name,
+            "description": &patch.description,
+            "tags": &patch.tags,
+            "last_modified": "$currentDate",
+            "version": &patch.version,
+        }
+    };
+
+    db.default_database()
+        .unwrap()
+        .collection::<AssetPack>("packs")
+        .update_one(
+            doc! {
+               "_id": &pack_id
+            },
+            modifications,
+            None,
+        )
         .await?;
 
     Ok(HttpResponse::Ok().finish())
@@ -142,13 +155,13 @@ async fn update_pack(
 
 #[delete("packs/{pack_id}")]
 async fn delete_pack(
-    tables: web::Data<TableServiceClient>,
+    db: web::Data<mongodb::Client>,
     blobs: web::Data<BlobServiceClient>,
     pack_id: web::Path<String>,
 ) -> Result<impl Responder> {
     let pack_id = pack_id.into_inner();
 
-    db::delete_pack(&tables, &blobs, pack_id).await?;
+    db::delete_pack(&db, &blobs, pack_id).await?;
 
     Ok(HttpResponse::Accepted().finish())
 }
