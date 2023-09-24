@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::{
     db,
-    models::{CompositorRunStatus, Layer, Template},
+    models::{Blueprint, CompositorRunStatus, Layer, Template},
     util::Result,
 };
 use actix_web::{post, web, HttpResponse, Responder};
@@ -29,6 +29,11 @@ pub struct TemplateRequest {
     layers: Vec<Layer>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct BlueprintRequest {
+    templates: Vec<TemplateRequest>,
+}
+
 impl From<TemplateRequest> for Template {
     fn from(value: TemplateRequest) -> Self {
         Self {
@@ -39,14 +44,22 @@ impl From<TemplateRequest> for Template {
     }
 }
 
+impl From<BlueprintRequest> for Blueprint {
+    fn from(value: BlueprintRequest) -> Self {
+        Self {
+            templates: value.templates.into_iter().map(|t| t.into()).collect(),
+        }
+    }
+}
+
 #[post("compositor")]
 async fn run_template(
     UserSession(session_token): UserSession,
     db: web::Data<mongodb::Client>,
-    queue: web::Data<Sender<(String, Template)>>,
-    template: web::Json<TemplateRequest>,
+    queue: web::Data<Sender<(String, Blueprint)>>,
+    blueprint: web::Json<BlueprintRequest>,
 ) -> Result<impl Responder> {
-    let template: Template = template.into_inner().into();
+    let blueprint: Blueprint = blueprint.into_inner().into();
 
     let session = db
         .database("userdata")
@@ -74,7 +87,7 @@ async fn run_template(
 
     let run_id = result.inserted_id.as_object_id().unwrap().to_hex();
 
-    queue.send((run_id.clone(), template)).await?;
+    queue.send((run_id.clone(), blueprint)).await?;
 
     Ok(HttpResponse::Accepted().json(TemplateRun { run_id }))
 }
