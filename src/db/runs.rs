@@ -1,39 +1,28 @@
-use bson::Bson;
 use serde::{Deserialize, Serialize};
 
 use super::DateTime;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CompositorRun {
-    #[serde(rename = "_id", skip_serializing)]
-    pub id: bson::oid::ObjectId,
+    #[serde(
+        rename = "_id",
+        with = "bson::serde_helpers::hex_string_as_object_id",
+        skip_serializing
+    )]
+    pub id: String,
     pub created: DateTime,
-    pub status: CompositorRunStatus,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
-pub enum CompositorRunStatus {
-    Running,
-    Succeeded,
-    Failed,
-}
-
-impl From<CompositorRunStatus> for Bson {
-    fn from(value: CompositorRunStatus) -> Self {
-        match value {
-            CompositorRunStatus::Running => Bson::String("running".to_string()),
-            CompositorRunStatus::Succeeded => Bson::String("succeeded".to_string()),
-            CompositorRunStatus::Failed => Bson::String("failed".to_string()),
-        }
-    }
+    pub status: u32,
+    #[serde(with = "bson::serde_helpers::hex_string_as_object_id")]
+    pub author: String,
 }
 
 impl From<CompositorRun> for crate::models::CompositorRun {
     fn from(value: CompositorRun) -> Self {
         Self {
-            id: value.id.to_string(),
+            id: value.id,
             created: value.created,
-            status: value.status,
+            status: value.status.try_into().unwrap(),
+            author: value.author,
         }
     }
 }
@@ -43,7 +32,8 @@ impl From<crate::models::CompositorRun> for CompositorRun {
         Self {
             id: Default::default(),
             created: value.created,
-            status: value.status,
+            status: value.status as u32,
+            author: value.author,
         }
     }
 }

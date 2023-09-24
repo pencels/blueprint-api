@@ -4,7 +4,6 @@ use std::slice;
 use std::sync::Arc;
 
 use azure_storage_blobs::prelude::BlobServiceClient;
-use bson::oid::ObjectId;
 use futures::TryStreamExt;
 use image::codecs::png::PngEncoder;
 use image::imageops::FilterType;
@@ -12,10 +11,9 @@ use image::{imageops, RgbaImage};
 use imageproc::geometric_transformations::Interpolation;
 use itertools::{Itertools, MultiProduct};
 use mongodb::bson::doc;
-use time::OffsetDateTime;
 
-use crate::db::{CompositorRun, CompositorRunStatus};
-use crate::models::{Degrees, Scale, Template};
+use crate::db::CompositorRun;
+use crate::models::{CompositorRunStatus, Degrees, Scale, Template};
 use crate::util::Result;
 
 use super::image_cache::ImageCache;
@@ -68,27 +66,7 @@ impl Compositor {
         Ok(canvas)
     }
 
-    pub async fn run_template(&self, template: Template) -> Result<(ObjectId, Result<()>)> {
-        let runs_coll = self
-            .db
-            .default_database()
-            .unwrap()
-            .collection::<CompositorRun>("runs");
-        let run = CompositorRun {
-            id: Default::default(),
-            created: OffsetDateTime::now_utc().into(),
-            status: CompositorRunStatus::Running,
-        };
-        let result = runs_coll.insert_one(&run, None).await?;
-        let id = result.inserted_id.as_object_id().unwrap();
-        Ok((id, self.run_template_internal(id, template).await))
-    }
-
-    pub async fn run_template_internal(
-        &self,
-        run_id: ObjectId,
-        mut template: Template,
-    ) -> Result<()> {
+    pub async fn run_template(&self, run_id: &String, mut template: Template) -> Result<()> {
         let runs_coll = self
             .db
             .default_database()
@@ -128,7 +106,7 @@ impl Compositor {
 
             let modifications = doc! {
                 "$set": {
-                    "status": CompositorRunStatus::Running,
+                    "status": CompositorRunStatus::Running as u32,
                 }
             };
 
@@ -139,7 +117,7 @@ impl Compositor {
 
         let modifications = doc! {
             "$set": {
-                "status": CompositorRunStatus::Succeeded,
+                "status": CompositorRunStatus::Succeeded as u32,
             }
         };
         runs_coll

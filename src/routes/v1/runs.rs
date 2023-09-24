@@ -1,6 +1,6 @@
 use std::io::{Cursor, Write};
 
-use crate::{models::CompositorRun, util::Result};
+use crate::{db, models, util::Result};
 use actix_web::{get, http::header, web, HttpResponse, Responder};
 use azure_storage_blobs::prelude::BlobServiceClient;
 use bson::doc;
@@ -8,7 +8,22 @@ use futures::TryStreamExt;
 use zip::write::FileOptions;
 
 pub fn config(cfg: &mut actix_web::web::ServiceConfig) {
-    cfg.service(get_run).service(get_run_results_zip);
+    cfg.service(get_runs)
+        .service(get_run)
+        .service(get_run_results_zip);
+}
+
+#[get("runs")]
+pub async fn get_runs(db: web::Data<mongodb::Client>) -> Result<impl Responder> {
+    let response = db
+        .default_database()
+        .unwrap()
+        .collection::<db::CompositorRun>("runs")
+        .find(doc! {}, None)
+        .await?;
+
+    let runs: Vec<models::CompositorRun> = response.map_ok(|run| run.into()).try_collect().await?;
+    Ok(HttpResponse::Ok().json(runs))
 }
 
 #[get("runs/{run_id}")]
@@ -20,12 +35,15 @@ pub async fn get_run(
     let response = db
         .default_database()
         .unwrap()
-        .collection::<CompositorRun>("runs")
+        .collection::<db::CompositorRun>("runs")
         .find_one(doc! { "_id": &run_id }, None)
         .await?;
 
     match response {
-        Some(run) => Ok(HttpResponse::Ok().json(run)),
+        Some(run) => {
+            let run: models::CompositorRun = run.into();
+            Ok(HttpResponse::Ok().json(run))
+        }
         None => Ok(HttpResponse::NotFound().finish()),
     }
 }

@@ -59,16 +59,16 @@ async fn main() -> std::io::Result<()> {
     let compositor = Compositor::new(db_client.clone(), blob_service.clone());
 
     // Template processing
-    let (template_queue, recv) = async_channel::unbounded::<Template>();
+    let (template_queue, recv) = async_channel::unbounded::<(String, Template)>();
     for _ in 0..NUM_TEMPLATE_WORKERS {
         let compositor = compositor.clone();
         let recv = recv.clone();
         tokio::spawn(async move {
             loop {
-                let template = recv.recv().await.expect("channel closed unexpectedly");
-                match compositor.run_template(template).await.unwrap() {
-                    (run_id, Ok(_)) => log::info!("template run {} succeeded", &run_id),
-                    (run_id, Err(e)) => log::error!("template run {} failed: {}", &run_id, e),
+                let (run_id, template) = recv.recv().await.expect("channel closed unexpectedly");
+                match compositor.run_template(&run_id, template).await {
+                    Ok(_) => log::info!("template run {} succeeded", &run_id),
+                    Err(e) => log::error!("template run {} failed: {}", &run_id, e),
                 };
             }
         });
@@ -78,7 +78,8 @@ async fn main() -> std::io::Result<()> {
         let cors = Cors::default()
             .allowed_origin("http://localhost:4321")
             .supports_credentials()
-            .allowed_methods(vec!["GET", "POST", "DELETE"]);
+            .allowed_headers(vec!["Content-Type"])
+            .allowed_methods(vec!["GET", "POST", "DELETE", "OPTIONS"]);
         App::new()
             .wrap(Logger::default())
             .wrap(cors)
