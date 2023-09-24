@@ -10,4 +10,6 @@ pub struct AssetPack {
     pub tags: Vec<String>,
     pub last_modified: DateTime,
     pub version: String,
+    pub author: String,
+    pub manifest: Vec<String>,
 }

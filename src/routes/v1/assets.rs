@@ -4,7 +4,7 @@ use actix_web::{
     http::StatusCode,
     patch, post,
     web::{self, Json},
-    HttpResponse, Responder,
+    HttpRequest, HttpResponse, Responder,
 };
 use azure_storage_blobs::prelude::BlobServiceClient;
 use bson::doc;
@@ -24,6 +24,7 @@ pub fn config(cfg: &mut actix_web::web::ServiceConfig) {
     cfg.service(download_asset)
         .service(get_packs)
         .service(get_pack)
+        .service(get_pack_manifest)
         .service(create_pack)
         .service(update_pack)
         .service(delete_pack);
@@ -35,7 +36,6 @@ struct UploadPack {
     description: text::Text<String>,
     tags: text::Text<String>,
     version: text::Text<String>,
-    #[multipart]
     file: TempFile,
 }
 
@@ -79,13 +79,46 @@ async fn get_pack(
     }
 }
 
+#[get("packs/{pack_id}/manifest")]
+async fn get_pack_manifest(
+    db: web::Data<mongodb::Client>,
+    slug: web::Path<String>,
+) -> Result<impl Responder> {
+    let slug = slug.into_inner();
+
+    let result = db
+        .default_database()
+        .unwrap()
+        .collection::<db::AssetPack>("packs")
+        .find_one(doc! { "_id": slug }, None)
+        .await?;
+
+    match result {
+        Some(pack) => Ok(HttpResponse::Ok().json(pack.manifest)),
+        None => Ok(HttpResponse::NotFound().finish()),
+    }
+}
+
 #[post("packs/{pack_id}")]
 async fn create_pack(
+    req: HttpRequest,
     db: web::Data<mongodb::Client>,
     blobs: web::Data<BlobServiceClient>,
     slug: web::Path<String>,
     MultipartForm(form): MultipartForm<UploadPack>,
 ) -> Result<impl Responder> {
+    let session_token = req.cookie("next-auth.session-token").unwrap();
+
+    let session = db
+        .database("userdata")
+        .collection::<db::Session>("sessions")
+        .find_one(doc! { "sessionToken": session_token.value() }, None)
+        .await?;
+
+    let Some(session) = session else {
+        return Ok(HttpResponse::BadRequest().body("missing session token for this request"));
+    };
+
     let pack = AssetPack {
         slug: slug.clone(),
         description: form.description.into_inner(),
@@ -99,6 +132,8 @@ async fn create_pack(
             .collect(),
         last_modified: OffsetDateTime::now_utc().into(),
         version: form.version.into_inner(),
+        author: session.user_id,
+        manifest: Default::default(),
     };
 
     // Create pack metadata
@@ -106,7 +141,7 @@ async fn create_pack(
 
     // Upload pack data in the bg
     tokio::spawn(async move {
-        match db::upload_zipped_pack(&blobs, form.file, &slug).await {
+        match db::upload_zipped_pack(&db, &blobs, form.file, &slug).await {
             Ok(_) => {}
             Err(e) => {
                 log::error!("error uploading zip file for {}: {}", &slug, e);
@@ -115,7 +150,7 @@ async fn create_pack(
         }
     });
 
-    Ok(HttpResponse::Accepted())
+    Ok(HttpResponse::Accepted().finish())
 }
 
 #[patch("packs/{pack_id}")]

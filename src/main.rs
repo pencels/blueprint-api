@@ -77,6 +77,7 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         let cors = Cors::default()
             .allowed_origin("http://localhost:4321")
+            .supports_credentials()
             .allowed_methods(vec!["GET", "POST", "DELETE"]);
         App::new()
             .wrap(Logger::default())

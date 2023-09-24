@@ -6,6 +6,8 @@ mod assets;
 pub use assets::*;
 mod runs;
 pub use runs::*;
+mod sessions;
+pub use sessions::*;
 
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU8;

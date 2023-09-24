@@ -8,17 +8,6 @@ use serde::{Deserialize, Serialize};
 
 use super::{get_entities, DateTime};
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Asset {
-    #[serde(rename = "PartitionKey")]
-    pub partition_key: String,
-    #[serde(rename = "RowKey")]
-    pub row_key: String,
-    pub slug: String,
-    pub file_name: String,
-    pub content_type: Option<String>,
-}
-
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AssetPack {
     #[serde(rename = "_id")]
@@ -28,6 +17,9 @@ pub struct AssetPack {
     pub description: String,
     pub tags: Vec<String>,
     pub version: String,
+    #[serde(with = "bson::serde_helpers::hex_string_as_object_id")]
+    pub author: String,
+    pub manifest: Vec<String>,
 }
 
 impl From<crate::models::AssetPack> for AssetPack {
@@ -39,6 +31,8 @@ impl From<crate::models::AssetPack> for AssetPack {
             tags: pack.tags,
             last_modified: pack.last_modified,
             version: pack.version,
+            author: pack.author,
+            manifest: pack.manifest,
         }
     }
 }
@@ -52,6 +46,8 @@ impl From<AssetPack> for crate::models::AssetPack {
             slug: value.slug,
             last_modified: value.last_modified,
             version: value.version,
+            author: value.author,
+            manifest: value.manifest,
         }
     }
 }
@@ -96,6 +92,7 @@ pub async fn create_pack(
 }
 
 pub async fn upload_zipped_pack(
+    db: &mongodb::Client,
     blobs: &BlobServiceClient,
     file_metadata: TempFile,
     pack_slug: &str,
@@ -115,6 +112,20 @@ pub async fn upload_zipped_pack(
                 .ok_or_else(|| format!("zip file escapes archive: {}", file.name()))?;
             name.as_os_str().to_string_lossy().to_string()
         };
+
+        let update = doc! {
+            "$push": {
+                "manifest": name.clone(),
+            }
+        };
+
+        log::info!("updating blah");
+
+        db.default_database()
+            .unwrap()
+            .collection::<AssetPack>("packs")
+            .update_one(doc! { "_id": pack_slug }, update, None)
+            .await?;
 
         blobs
             .container_client(format!("pack-{}", pack_slug))
