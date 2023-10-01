@@ -20,7 +20,7 @@ pub struct ImageCache {
 
 #[derive(Debug, Clone)]
 pub struct CacheError {
-    message: String,
+    pub message: String,
 }
 
 impl<E: std::error::Error> From<E> for CacheError {

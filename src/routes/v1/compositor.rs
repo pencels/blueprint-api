@@ -31,7 +31,7 @@ pub struct TemplateRequest {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct BlueprintRequest {
-    templates: Vec<TemplateRequest>,
+    templates: String,
 }
 
 impl From<TemplateRequest> for Template {
@@ -47,7 +47,10 @@ impl From<TemplateRequest> for Template {
 impl From<BlueprintRequest> for Blueprint {
     fn from(value: BlueprintRequest) -> Self {
         Self {
-            templates: value.templates.into_iter().map(|t| t.into()).collect(),
+            author: String::new(),
+            id: Default::default(),
+            name: String::from("Ad-hoc blueprint"),
+            templates: serde_json::from_str(&value.templates).unwrap(),
         }
     }
 }

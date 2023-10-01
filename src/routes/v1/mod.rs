@@ -1,14 +1,16 @@
 mod assets;
+mod blueprints;
+mod compositor;
 mod runs;
-mod template;
 mod users;
 use std::pin::Pin;
 
 use actix_web::FromRequest;
 pub use assets::*;
+pub use blueprints::*;
+pub use compositor::*;
 use futures::Future;
 pub use runs::*;
-pub use template::*;
 pub use users::*;
 
 use serde::{Deserialize, Serialize};
@@ -25,7 +27,8 @@ pub fn config(cfg: &mut actix_web::web::ServiceConfig) {
         actix_web::web::scope("v1")
             .configure(users::config)
             .configure(assets::config)
-            .configure(template::config)
+            .configure(blueprints::config)
+            .configure(compositor::config)
             .configure(runs::config),
     );
 }

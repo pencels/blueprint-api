@@ -8,6 +8,8 @@ mod runs;
 pub use runs::*;
 mod sessions;
 pub use sessions::*;
+mod blueprints;
+pub use blueprints::*;
 
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU8;
